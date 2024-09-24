@@ -86,8 +86,8 @@ If not specified, it defaults to the name your program was started with.
 ```erlang
     pid             %% log the process ID with each message
     cons            %% log to the system console if logging facility unavailable
-    odelay          %% open the connection to the logging facility immediately
-    ndelay          %% delay logging facility connection until a log is written
+    ndelay          %% open the connection to the logging facility immediately
+    odelay          %% delay logging facility connection until a log is written
     nowait          %% low-level option, generally deprecated, look it up
     perror          %% log to standard error stream as well
 ```
