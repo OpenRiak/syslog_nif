@@ -1,7 +1,7 @@
 %% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2023 Workday, Inc.
+%% Copyright (c) 2023-2025 Workday, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -28,17 +28,36 @@
 %% There is no public API, this module simply sets up the configured
 %% handler(s) and services logging requests through the NIF.
 %%
+%% To the extent reasonable, error results mimic those of the OTP kernel's
+%% included handlers and formatter.
+%%
+%% === Behaviors ===
+%% <ul>
+%% <li><a
+%%  href="https://www.erlang.org/doc/apps/kernel/logger_handler.html"
+%%  target="_blank">logger_handler</a></li>
+%% <li><a
+%%  href="https://www.erlang.org/doc/apps/kernel/logger_formatter.html"
+%%  target="_blank">logger_formatter</a></li>
+%% </ul>
 %% @end
 -module(syslog).
-
--behaviour(application).
--behaviour(gen_server).
-%% Because there are no logger_xxx behaviors, xref sees the logger callbacks
-%% as unused exports, but we can mock behaviors from its perspective ...
-%% Xref -behavior(logger_handler):
+-ifndef(EDOC).
+-behavior(application).
+-behavior(gen_server).
+-if(?OTP_RELEASE >= 27).
+-behavior(logger_handler).
+-behavior(logger_formatter).
+-else.  % OTP_RELEASE < 27
+%% Because there are no logger_xxx behaviors prior to OTP 27, xref sees the
+%% logger callbacks as unused exports, but we can mock behaviors from its
+%% perspective ...
+%% -behavior(logger_handler):
 -ignore_xref([adding_handler/1, changing_config/3, filter_config/1, log/2]).
-%% Xref -behavior(logger_formatter):
+%% -behavior(logger_formatter):
 -ignore_xref([check_config/1, format/2]).
+-endif. % OTP_RELEASE
+-endif. % EDOC
 
 %% -------------------------------------------------------------------
 %%
@@ -69,7 +88,7 @@
 %%
 %% DO NOT ENABLE INLINING!
 %% The compiler 'inline' option WILL break this module, as the NIF stub
-%% functions are are small enough to be inlined away.
+%% functions are small enough to be inlined away.
 %% Newer compilers will generate a warning that we force to an error with the
 %% compiler directive below, but older ones (before OTP 23) will happily
 %% generate broken code that unconditionally raises a `syslog_nif_not_loaded'
@@ -107,11 +126,43 @@
     check_config/1,
     format/2
 ]).
+-ifdef(TIMING_TESTS).
+-export([
+    timing_test_/0,
+    timer_proc/4
+]).
+-endif. % TIMING_TESTS
 
 -export_type([
+    cfg_error/0,
     facility/0,
+    fmt_config/0,
+    fmt_error/0,
+    hnd_config/0,
+    hnd_error/0,
+    ident/0,
     option/0
 ]).
+
+-define(CFG_ERROR(Type), {error, {Type, module(), err_map()}}).
+
+-type cfg_error() :: fmt_error() | hnd_error().
+-type err_key() :: term().
+-type err_map() :: #{err_key() => err_val()}.
+-type err_val() :: term().
+-type fmt_error() :: ?CFG_ERROR(invalid_formatter_config).
+-type hnd_error() :: ?CFG_ERROR(invalid_config).
+-type sz_limit() :: pos_integer() | unlimited.
+
+-type fmt_config() :: #{
+    chars_limit     => sz_limit(),
+    depth           => sz_limit(),
+    legacy_header   => false,
+    max_size        => sz_limit(),
+    report_cb       => logger:report_cb(),
+    single_line     => true
+}.
+-type hnd_config() :: facility() | default.
 
 -type facility() ::
     kernel | user | mail | daemon | auth | lpr | news | uucp | cron |
@@ -125,15 +176,27 @@
     local0, local1, local2, local3, local4, local5, local6, local7
 ]).
 
+-type ident() :: atom() | binary() | nonempty_string().
 -type option() :: pid | cons | odelay | ndelay | nowait | perror.
+
+%% -------------------------------------------------------------------
+%% Internal
+%% -------------------------------------------------------------------
+
+-type err_rec() :: {err_key(), err_val()}.
+-type err_recs() :: list(err_rec()).
 
 -type fac_int() :: 0..(23 bsl 3).
 -type opt_int() :: 0..63.
 -type pri_int() :: 0..((23 bsl 3) bor 7).
 -type sev_int() :: 0..7.
 
+-type report_cb_1() :: fun((logger:report()) -> {io:format(), list()}).
+-type report_cb_2() :: fun((logger:report(), logger:report_cb_config())
+    -> unicode:chardata()).
+
 -type config() :: #{
-    identity  := nonempty_string(),
+    identity  := ident(),
     facility  := facility(),
     options   := list(option())
 }.
@@ -150,37 +213,58 @@
 
 -include_lib("kernel/include/logger.hrl").
 -ifdef(EUNIT).
--include_lib("eunit/include/eunit.hrl").
+-include_lib("stdlib/include/assert.hrl").
 -endif. % EUNIT
 
+-define(APP_NAME,   syslog).
+-define(NIF_NAME,   syslog_nif).
+-define(SVC_NAME,   ?MODULE).
+-define(DFLT_FAC,   user).
+-define(DFLT_OPTS,  [pid, cons]).
+
 %% -------------------------------------------------------------------
-%% logger handler callbacks
+%% logger_handler callbacks
 %% -------------------------------------------------------------------
 
--spec adding_handler(HConfig :: logger:handler_config())
-        -> {ok, logger:handler_config()} | {error, term()}.
+-spec adding_handler(HConfig :: logger:handler_config() )
+        -> {ok, logger:handler_config()} | cfg_error() | {error, term()}.
+%% @doc <a
+%% href="https://www.erlang.org/doc/apps/kernel/logger_handler.html#c:adding_handler/1"
+%% target="_blank">logger_handler:adding_handler/1</a> callback.
 adding_handler(HConfig) ->
-    gen_server:call(?MODULE, {adding_handler, HConfig}).
+    gen_server:call(?SVC_NAME, {?FUNCTION_NAME, HConfig}).
 
 -spec changing_config(Mode :: set | update,
     OldHConfig :: logger:handler_config(),
-    NewHConfig :: logger:handler_config())
-        -> {ok, logger:handler_config()} | {error, term()}.
+    NewHConfig :: logger:handler_config() )
+        -> {ok, logger:handler_config()} | cfg_error() | {error, term()}.
+%% @doc <a
+%% href="https://www.erlang.org/doc/apps/kernel/logger_handler.html#c:changing_config/3"
+%% target="_blank">logger_handler:changing_config/3</a> callback.
 changing_config(Mode, OldHConfig, NewHConfig) ->
-    gen_server:call(?MODULE, {changing_config, Mode, OldHConfig, NewHConfig}).
+    gen_server:call(?SVC_NAME, {?FUNCTION_NAME, Mode, OldHConfig, NewHConfig}).
 
--spec filter_config(HConfig :: logger:handler_config())
+-spec filter_config(HConfig :: logger:handler_config() )
         -> logger:handler_config().
+%% @doc <a
+%% href="https://www.erlang.org/doc/apps/kernel/logger_handler.html#c:filter_config/1"
+%% target="_blank">logger_handler:filter_config/1</a> callback.
 filter_config(HConfig) ->
-    gen_server:call(?MODULE, {filter_config, HConfig}).
+    gen_server:call(?SVC_NAME, {?FUNCTION_NAME, HConfig}).
 
--spec log(Event :: logger:log_event(), Config :: logger:handler_config())
+-spec log(Event :: logger:log_event(), Config :: logger:handler_config() )
         -> ok.
-%% @hidden Do as much prep as possible in Erlang code to spend the briefest
+%% @doc <a
+%% href="https://www.erlang.org/doc/apps/kernel/logger_handler.html#c:log/2"
+%% target="_blank">logger_handler:log/2</a> callback.
+%%
+%% Does as much prep as possible in Erlang code to spend the briefest
 %% possible time in the NIF.
-%% Pass the formatted message to the NIF as a null-terminated binary.
+%%
+%% Optimized for this module's formatter, which can be called locally.
+%% @end
+%% Passes the formatted message to the NIF as a null-terminated binary.
 %% IMPORTANT! If the binary isn't null terminated, the NIF will raise a badarg.
-%% Optimize for this module's formatter, which can be called locally.
 log(#{level := Level} = Event,
         #{formatter := {?MODULE, FmtConf}, config := Facility} = _HConfig ) ->
     MsgBin = erlang:iolist_to_binary([format(Event, FmtConf), 0]),
@@ -191,52 +275,47 @@ log(#{level := Level} = Event,
     nif_log(Facility bor level(Level), MsgBin).
 
 %% -------------------------------------------------------------------
-%% logger formatter callbacks
+%% logger_formatter callbacks
 %% -------------------------------------------------------------------
 
--spec check_config(FConfig :: logger:formatter_config())
-        -> ok | {error, term()}.
+-spec check_config(FConfig :: fmt_config() )
+        -> ok | fmt_error().
+%% @doc <a
+%% href="https://www.erlang.org/doc/apps/kernel/logger_formatter.html#c:check_config/1"
+%% target="_blank">logger_formatter:check_config/1</a> callback.
+%%
+%% FConfig is a subset of <a
+%% href="https://www.erlang.org/doc/apps/kernel/logger_formatter#t:config/0"
+%% target="_blank">logger_formatter:config()</a> restricted to the keys and
+%% values specified for {@link fmt_config()}.
+%%
+%% Note that:<ul>
+%% <li>For 'report' events where a 2-parameter `report_cb' function is
+%%  specified in either FConfig or the event's metadata, only the
+%%  `chars_limit', `depth', and `max_size' values have any effect.</li>
+%% <li>For all other log events only the `depth' and `max_size' values
+%%  have any effect.</li>
+%% <li>The `legacy_header' and `single_line' values are allowed as constrained
+%%  by the {@link fmt_config()} specification for compatibility, but are
+%%  otherwise ignored.</li>
+%% <li>All other `logger_formatter:config()' keys are disallowed and return
+%%  an error result.</li>
+%% </ul>
 check_config(FConfig) ->
-    E1 = case FConfig of
-        #{single_line := true} ->
-            [];
-        #{single_line := BadSL} ->
-            [{single_line, BadSL}];
-        _ ->
-            []
-    end,
-    E2 = case FConfig of
-        #{depth := unlimited} ->
-            E1;
-        #{depth := D} when erlang:is_integer(D) andalso D > 0 ->
-            E1;
-        #{depth := BadD} ->
-            [{depth, BadD} | E1];
-        _ ->
-            E1
-    end,
-    E3 = case FConfig of
-        #{max_size := unlimited} ->
-            E2;
-        #{max_size := S} when erlang:is_integer(S) andalso S > 0 ->
-            E2;
-        #{max_size := BadS} ->
-            [{max_size, BadS} | E2];
-        _ ->
-            E2
-    end,
-    case E3 of
+    case maps:fold(fun check_config/3, [], FConfig) of
         [] ->
             ok;
-        _ ->
-            {error, {invalid_syslog_config, E3}}
+        Errors ->
+            {error, {invalid_formatter_config,
+                ?MODULE, maps:from_list(Errors)}}
     end.
 
 -spec format(
-    Event :: logger:log_event(),
-    FConfig :: logger:formatter_config() )
+    Event :: logger:log_event(), FConfig :: fmt_config() )
         -> unicode:chardata().
-
+%% @doc <a
+%% href="https://www.erlang.org/doc/apps/kernel/logger_formatter.html#c:format/2"
+%% target="_blank">logger_formatter:format/2</a> callback.
 format(#{msg := {string, Str}, level := Level} = Event,
         #{max_size := Size} = _FConfig) ->
     S1 = lists:flatten(
@@ -246,12 +325,27 @@ format(#{msg := {string, Str}, level := Level} = Event, _FConfig) ->
     [format_level(Level), format_meta(Event), $\s, string:trim(Str)];
 format(#{msg := {report, _Rpt}} = Event, FConfig) ->
     format_report(Event, FConfig);
+format(#{msg := {Fmt, Args}} = Event,
+        #{chars_limit := CLimit, depth := Depth} = FConfig) ->
+    Scan = io_lib:scan_format(Fmt, Args),
+    Filt = format_filter(Scan, Depth),
+    Text = io_lib:build_text(Filt, [{chars_limit, CLimit}]),
+    format(Event#{msg => {string, Text}}, FConfig);
+format(#{msg := {Fmt, Args}} = Event, #{chars_limit := CLimit} = FConfig) ->
+    Scan = io_lib:scan_format(Fmt, Args),
+    Filt = format_filter(Scan),
+    Text = io_lib:build_text(Filt, [{chars_limit, CLimit}]),
+    format(Event#{msg => {string, Text}}, FConfig);
 format(#{msg := {Fmt, Args}} = Event, #{depth := Depth} = FConfig) ->
-    format(Event#{msg => {string, io_lib:build_text(
-        format_filter(io_lib:scan_format(Fmt, Args), Depth))}}, FConfig);
+    Scan = io_lib:scan_format(Fmt, Args),
+    Filt = format_filter(Scan, Depth),
+    Text = io_lib:build_text(Filt),
+    format(Event#{msg => {string, Text}}, FConfig);
 format(#{msg := {Fmt, Args}} = Event, FConfig) ->
-    format(Event#{msg => {string, io_lib:build_text(
-        format_filter(io_lib:scan_format(Fmt, Args)))}}, FConfig).
+    Scan = io_lib:scan_format(Fmt, Args),
+    Filt = format_filter(Scan),
+    Text = io_lib:build_text(Filt),
+    format(Event#{msg => {string, Text}}, FConfig).
 
 %% -------------------------------------------------------------------
 %% application callbacks
@@ -260,16 +354,18 @@ format(#{msg := {Fmt, Args}} = Event, FConfig) ->
 -spec start(
     StartType :: application:start_type(),
     StartArgs :: term() )
-        -> {ok, pid()} | {error, term()}.
+        -> {ok, pid()} | cfg_error() | {error, term()}.
+%% @hidden
 start(_StartType, _StartArgs) ->
     case init_state() of
         {ok, State} ->
-            gen_server:start_link({local, ?MODULE}, ?MODULE, State, []);
+            gen_server:start_link({local, ?SVC_NAME}, ?MODULE, State, []);
         Error ->
             Error
     end.
 
 -spec stop(State :: term()) -> Ignored :: ok.
+%% @hidden
 stop(_State) ->
     ok.
 
@@ -279,6 +375,7 @@ stop(_State) ->
 
 -spec init(State :: state())
         -> {ok, state()} | {ok, state(), {continue, term()}} | {stop, term()}.
+%% @hidden
 init(#{config := Config} = State) ->
     case init_log(Config) of
         ok ->
@@ -290,6 +387,7 @@ init(#{config := Config} = State) ->
 
 -spec handle_call(Request :: term(), From :: {pid(), _}, State :: state())
         -> {reply, term(), state()}.
+%% @hidden
 handle_call({adding_handler, HConfig}, _From, State) ->
     Result = case maps:get(config, HConfig, default) of
         default ->
@@ -336,15 +434,17 @@ handle_call(_Req, _From, State) ->
 
 -spec handle_cast(Request :: term(), State :: state())
         -> {noreply, state()}.
+%% @hidden
 handle_cast(_Req, State) ->
     {noreply, State}.
 
 -spec handle_continue(Continue :: term(), State :: state())
         -> {noreply, state()}.
+%% @hidden
 handle_continue(add_handlers, State) ->
     %% Spawn adding handlers, it'll cause callbacks into the gen_server that
     %% would deadlock if called from this process.
-    _ = erlang:spawn(logger, add_handlers, [?MODULE]),
+    _ = erlang:spawn(logger, add_handlers, [?APP_NAME]),
     {noreply, State}.
 
 %% -------------------------------------------------------------------
@@ -356,10 +456,31 @@ handle_continue(add_handlers, State) ->
 %% io:format arg, but we can and do clear them out of the format itself.
 %%
 
--spec format_filter(Specs :: list(io_lib:format_spec()))
+-spec check_config(
+    Key :: term(), Val :: term(), Errors :: list(tuple()) )
+        -> list(tuple()).
+%% @hidden
+%% @doc Map folder for {@link check_config/1}.
+check_config(Key, Val, Errors) when
+        (Key =:= chars_limit orelse Key =:= depth orelse Key =:= max_size)
+        andalso (Val =:= unlimited
+            orelse (erlang:is_integer(Val) andalso Val > 0)) ->
+    Errors;
+check_config(single_line, true, Errors) ->
+    Errors;
+check_config(legacy_header, false, Errors) ->
+    Errors;
+check_config(report_cb, CB, Errors) when
+        erlang:is_function(CB, 1) orelse erlang:is_function(CB, 2) ->
+    Errors;
+check_config(Key, Val, Errors) ->
+    [{Key, Val} | Errors].
+
+-spec format_filter(Specs :: list(io_lib:format_spec()) )
         -> list(io_lib:format_spec()).
-%% @hidden No depth limit specified
-format_filter([$n | Specs]) ->
+%% @hidden
+%% @doc No depth limit specified
+format_filter([$\n | Specs]) ->
     [$,, $\s | format_filter(Specs)];
 format_filter([#{control_char := $n} | Specs]) ->
     [$,, $\s | format_filter(Specs)];
@@ -374,7 +495,8 @@ format_filter([]) ->
     Specs :: list(io_lib:format_spec()),
     Depth :: pos_integer() )
         -> list(io_lib:format_spec()).
-%% @hidden Depth limit specified
+%% @hidden
+%% @doc Depth limit specified
 format_filter([$\n | Specs], Depth) ->
     [$,, $\s | format_filter(Specs, Depth)];
 format_filter([#{control_char := $n} | Specs], Depth) ->
@@ -406,9 +528,9 @@ format_level(notice)    -> "NOTICE";
 format_level(info)      -> "INFO";
 format_level(debug)     -> "DEBUG";
 format_level(Level) ->
-    erlang:error(badarg, [?MODULE, ?FUNCTION_NAME, Level]).
+    erlang:error(badarg, [{?MODULE, ?FUNCTION_NAME}, Level]).
 
--spec format_meta(Event :: logger:log_event()) -> unicode:chardata().
+-spec format_meta(Event :: logger:log_event() ) -> unicode:chardata().
 format_meta(#{meta := #{mfa := {M, F, A}, line := L, pid := P}}) ->
     io_lib:format(" ~p:~s:~s/~b:~b:", [P, M, F, A, L]);
 format_meta(#{meta := #{pid := P}}) ->
@@ -418,27 +540,96 @@ format_meta(_) ->
 
 -spec format_report(
     Event :: logger:log_event(),
-    FConfig :: logger:formatter_config() )
+    FConfig :: fmt_config() )
         -> unicode:chardata().
-%% @hidden report_cb in FConfig takes precedence over it in metadata
+%% @hidden
+%% @doc report_cb in FConfig takes precedence over metadata.
 format_report(#{msg := {report, Rpt}} = Event, #{report_cb := CB} = FConfig)
         when erlang:is_function(CB, 1) ->
-    format(Event#{msg => CB(Rpt)}, FConfig);
+    format(Event#{msg => format_report_cb_1(CB, Rpt)}, FConfig);
 format_report(#{msg := {report, Rpt}} = Event, #{report_cb := CB} = FConfig)
         when erlang:is_function(CB, 2) ->
-    RC = maps:put(single_line, true, maps:with([depth, chars_limit], FConfig)),
-    format(Event#{msg => {string, CB(Rpt, RC)}}, FConfig);
+    format(Event#{msg => format_report_cb_2(CB, Rpt, FConfig)}, FConfig);
 format_report(
     #{msg := {report, Rpt}, meta := #{report_cb := CB}} = Event, FConfig)
         when erlang:is_function(CB, 1) ->
-    format(Event#{msg => CB(Rpt)}, FConfig);
+    format(Event#{msg => format_report_cb_1(CB, Rpt)}, FConfig);
 format_report(
     #{msg := {report, Rpt}, meta := #{report_cb := CB}} = Event, FConfig)
         when erlang:is_function(CB, 2) ->
-    RC = maps:put(single_line, true, maps:with([depth, chars_limit], FConfig)),
-    format(Event#{msg => {string, CB(Rpt, RC)}}, FConfig);
+    format(Event#{msg => format_report_cb_2(CB, Rpt, FConfig)}, FConfig);
 format_report(#{msg := {report, Rpt}} = Event, FConfig) ->
     format(Event#{msg => logger:format_report(Rpt)}, FConfig).
+
+-spec format_report_cb_1(
+    CbFun :: report_cb_1(),
+    Report :: logger:report() )
+        -> {string, Str :: unicode:chardata()}
+        |  {Fmt :: io:format(), Args :: list()}.
+format_report_cb_1(CbFun, Report) ->
+    try CbFun(Report) of
+        {Fmt, Args} = Msg when erlang:is_list(Args), erlang:is_list(Fmt) ->
+            Msg;
+        {Fmt, Args} = Msg when erlang:is_list(Args), erlang:is_binary(Fmt) ->
+            Msg;
+        {string, Str} = Msg when erlang:is_list(Str); erlang:is_binary(Str) ->
+            Msg;
+        {Fmt, Args} = Msg when erlang:is_list(Args),
+                erlang:is_atom(Fmt), Fmt =/= report ->
+            Msg;
+        Result ->
+            {"REPORT_CB/1 ERROR: ~0tp; Returned: ~0tp", [Report, Result]}
+    catch
+        C:R:S ->
+            {"REPORT_CB/1 CRASH: ~0tp; Reason: ~0tp",
+                [Report, {C, R, format_report_cb_stack(S)}]}
+    end.
+
+-spec format_report_cb_2(
+    CbFun :: report_cb_2(),
+    Report :: logger:report(),
+    FConfig :: fmt_config() )
+        -> {string, Str :: unicode:chardata()}
+        |  {Fmt :: nonempty_string(), Args :: list()}.
+%% @hidden
+format_report_cb_2(CbFun, Report, FConfig) ->
+    CbOpts = format_report_cb_opts(FConfig),
+    try CbFun(Report, CbOpts) of
+        Str when erlang:is_list(Str); erlang:is_binary(Str) ->
+            {string, Str};
+        Result ->
+            {"REPORT_CB/2 ERROR: ~0tp; Returned: ~0tp", [Report, Result]}
+    catch
+        C:R:S ->
+            {"REPORT_CB/2 CRASH: ~0tp; Reason: ~0tp",
+                [Report, {C, R, format_report_cb_stack(S)}]}
+    end.
+
+-spec format_report_cb_opts(
+    FConfig :: logger:formatter_config() )
+        -> logger:report_cb_config().
+%% @hidden
+format_report_cb_opts(#{chars_limit := CLimit, depth := Depth})
+        when erlang:is_integer(CLimit) andalso erlang:is_integer(Depth) ->
+    #{chars_limit => CLimit, depth => Depth, single_line => true};
+format_report_cb_opts(#{chars_limit := CLimit})
+        when erlang:is_integer(CLimit) ->
+    #{chars_limit => CLimit, single_line => true};
+format_report_cb_opts(#{depth := Depth}) when erlang:is_integer(Depth) ->
+    #{depth => Depth, single_line => true};
+format_report_cb_opts(_) ->
+    #{single_line => true}.
+
+-spec format_report_cb_stack(Frames :: list(tuple()) ) -> list(tuple()).
+%% @hidden Return only the stack frames up to and including the first frame
+%% in this module (the point from which the callback function was invoked).
+format_report_cb_stack([Frame | _Frames]) when erlang:is_tuple(Frame),
+        erlang:tuple_size(Frame) > 1, erlang:element(1, Frame) =:= ?MODULE ->
+    [Frame];
+format_report_cb_stack([Frame | Frames]) ->
+    [Frame | format_report_cb_stack(Frames)];
+format_report_cb_stack([]) ->
+    [].
 
 %% -------------------------------------------------------------------
 %% Handler Internal
@@ -448,46 +639,90 @@ format_report(#{msg := {report, Rpt}} = Event, FConfig) ->
 init_log(#{identity := Ident, facility := Facility, options := Opts}) ->
     nif_open(ident_binary(Ident), facility(Facility), options(Opts, 0)).
 
--spec init_state() -> {ok, state()} | {error, term()}.
+-spec init_state() -> {ok, state()} | hnd_error().
 init_state() ->
-    {IErr, Ident} = case application:get_env(?MODULE, identity) of
-        {ok, IVal} ->
-            validate_identity(IVal);
-        _ ->
-            {ok, [Prog]} = init:get_argument(progname),
-            {[], filename:basename(Prog)}
-    end,
-    {FErr, Fac} = case application:get_env(?MODULE, facility) of
-        {ok, FVal} ->
-            validate_facility(FVal);
-        _ ->
-            {[], user}
-    end,
-    {OErr, Opts} = case application:get_env(?MODULE, options) of
-        {ok, OVal} ->
-            validate_options(OVal);
-        _ ->
-            {[], [pid, cons]}
-    end,
-    case IErr ++ FErr ++ OErr of
-        [] ->
-            Config = #{identity => Ident, facility => Fac, options => Opts},
+    AppEnv  = maps:from_list(application:get_all_env(?APP_NAME)),
+    CfgKeys = [facility, identity, options],
+    case init_config(CfgKeys, AppEnv, [], #{}) of
+        Config when erlang:is_map(Config) ->
             {ok, #{config => Config, facmap => map_facilities()}};
         Errors ->
-            {error, {invalid_syslog_config, Errors}}
+            {error, {invalid_config, ?MODULE, maps:from_list(Errors)}}
     end.
 
+-spec init_config(
+    CfgKeys :: list(atom()),
+    AppEnv :: #{atom() => term()},
+    ErrAcc :: err_recs(),
+    CfgAcc :: #{atom() => term()} )
+        -> Config :: config() | Errors :: nonempty_list(err_rec()).
+
+init_config([facility = Key | Keys], #{facility := Val} = AppEnv, ErrAcc, CfgAcc) ->
+    try
+        _ = facility(Val),
+        init_config(Keys, AppEnv, ErrAcc, CfgAcc#{Key => Val})
+    catch
+        error:badarg ->
+            init_config(Keys, AppEnv, [{Key, Val} | ErrAcc], CfgAcc)
+    end;
+init_config([facility = Key | Keys], AppEnv, ErrAcc, CfgAcc) ->
+    init_config(Keys, AppEnv, ErrAcc, CfgAcc#{Key => ?DFLT_FAC});
+init_config([identity = Key | Keys], #{identity := Val} = AppEnv, ErrAcc, CfgAcc) ->
+    try
+        _ = ident_binary(Val),
+        init_config(Keys, AppEnv, ErrAcc, CfgAcc#{Key => Val})
+    catch
+        error:badarg ->
+            init_config(Keys, AppEnv, [{Key, Val} | ErrAcc], CfgAcc)
+    end;
+init_config([identity = Key | Keys], AppEnv, ErrAcc, CfgAcc) ->
+    ProgName = case init:get_argument(progname) of
+        {ok, [[Prog]]} ->
+            Prog;
+        {ok, [_|_] = Progs} ->
+            [[Last] | _] = lists:reverse(Progs),
+            Last;
+        _ ->
+            "beam"
+    end,
+    %% In case it was set with a path ...
+    Val = filename:basename(ProgName),
+    init_config(Keys, AppEnv, ErrAcc, CfgAcc#{Key => Val});
+init_config([options = Key | Keys], #{options := Val} = AppEnv, ErrAcc, CfgAcc) ->
+    try
+        _ = options(Val, 0),
+        init_config(Keys, AppEnv, ErrAcc, CfgAcc#{Key => Val})
+    catch
+        error:badarg ->
+            init_config(Keys, AppEnv, [{Key, Val} | ErrAcc], CfgAcc)
+    end;
+init_config([options = Key | Keys], AppEnv, ErrAcc, CfgAcc) ->
+    init_config(Keys, AppEnv, ErrAcc, CfgAcc#{Key => ?DFLT_OPTS});
+init_config([], _AppEnv, [], Config) ->
+    Config;
+init_config([], _AppEnv, Errors, _Config) ->
+    Errors;
+init_config(CfgKeys, AppEnv, ErrAcc, CfgAcc) ->
+    erlang:error(badarg,
+        [{?MODULE, ?FUNCTION_NAME}, CfgKeys, AppEnv, ErrAcc, CfgAcc]).
+
+-spec ident_binary(Ident :: ident() ) -> binary() | no_return().
+ident_binary(Ident) when
+        erlang:is_binary(Ident) andalso erlang:byte_size(Ident) > 0 ->
+    Ident;
 ident_binary([_|_] = Ident) ->
     erlang:list_to_binary(Ident);
 ident_binary(Ident) when erlang:is_atom(Ident) ->
-    erlang:atom_to_binary(Ident, latin1).
+    erlang:atom_to_binary(Ident);
+ident_binary(Ident) ->
+    erlang:error(badarg, [{?MODULE, ?FUNCTION_NAME}, Ident]).
 
 map_config(FacName) ->
     try
         {ok, facility(FacName)}
     catch
         error:badarg ->
-            {error, {invalid_syslog_config, [facility, FacName]}}
+            {error, {invalid_config, ?MODULE, #{facility => FacName}}}
     end.
 
 %% Generate the reverse lookup map for reporting/changing config.
@@ -497,48 +732,18 @@ map_facilities() ->
     lists:foldl(
         fun(V, M) ->
             K = (V bsl 3),
-            case maps:is_key(K, M) of
-                true ->
+            case M of
+                #{K := _} ->
                     M;
                 _ ->
                     M#{K => V}
             end
         end, Map, lists:seq(0, 23)).
 
-validate_facility(Fac) ->
-    try
-        _ = facility(Fac),
-        {[], Fac}
-    catch
-        error:badarg ->
-            {[facility, Fac], undefined}
-    end.
-
-validate_identity([_|_] = Ident) ->
-    case io_lib:deep_char_list(Ident) of
-        true ->
-            {[], lists:flatten(Ident)};
-        _ ->
-            {[{identity, Ident}], undefined}
-    end;
-validate_identity(Ident) when erlang:is_atom(Ident) ->
-    {[], Ident};
-validate_identity(Ident) ->
-    {[{identity, Ident}], undefined}.
-
-validate_options(Opts) ->
-    try
-        _ = options(Opts, 0),
-        {[], Opts}
-    catch
-        error:badarg ->
-            {[options, Opts], undefined}
-    end.
-
 %% -------------------------------------------------------------------
 %% Constant atom <=> integer mapping.
 %% Facility and Level are defined in IETF RFC 5424.
-%% Options are common across all common Unix variants.
+%% Options are constant across all common Unix variants.
 %% -------------------------------------------------------------------
 
 -spec facility(Facility :: facility()) -> fac_int().
@@ -579,7 +784,7 @@ level(notice)       -> 5;
 level(info)         -> 6;
 level(debug)        -> 7;
 level(Level) ->
-    erlang:error(badarg, [?MODULE, ?FUNCTION_NAME, Level]).
+    erlang:error(badarg, [{?MODULE, ?FUNCTION_NAME}, Level]).
 
 -spec options(Options :: list(option()), Result :: opt_int()) -> opt_int().
 options([], Result) -> Result;
@@ -590,7 +795,7 @@ options([ndelay | Opts], Result)  -> options(Opts, (Result bor  8));
 options([nowait | Opts], Result)  -> options(Opts, (Result bor 16));
 options([perror | Opts], Result)  -> options(Opts, (Result bor 32));
 options(Options, _Result) ->
-    erlang:error(badarg, [?MODULE, ?FUNCTION_NAME, Options]).
+    erlang:error(badarg, [{?MODULE, ?FUNCTION_NAME}, Options]).
 
 %% -------------------------------------------------------------------
 %% NIF operations
@@ -660,7 +865,7 @@ run_timing() ->
     Prio    = (facility(Facil) bor level(Level)),
     IDs     = lists:seq(1, NProc),
     Workers = [{Id, erlang:spawn(
-        fun() -> timer_proc(Owner, Id, Count, Prio) end)} || Id <- IDs],
+        ?MODULE, timer_proc, [Owner, Id, Count, Prio])} || Id <- IDs],
     _ = [receive {ready, Id} -> Id end || Id <- IDs],
     _ = [Pid ! {go, Owner} || {_Id, Pid} <- Workers],
     Results = [receive {done, Id, S, F} -> {Id, S, F} end

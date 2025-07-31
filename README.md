@@ -1,4 +1,7 @@
 # Syslog NIF
+
+[![Build Status](https://github.com/OpenRiak/syslog_nif/actions/workflows/erlang.yml/badge.svg)](https://github.com/OpenRiak/syslog_nif/actions/workflows/erlang.yml)
+
 An Erlang [`logger`](https://www.erlang.org/doc/man/logger.html) backend for Unix `syslog`.
 
 This is a small, fast, stable handler for OTP 21+ applications that need to record log events to the Unix `syslog` subsystem.
@@ -33,7 +36,7 @@ An example might look like the following:
     ]},
     {syslog, [
 
-        %% openlog initialization values
+        %% openlog initialization values.
         {identity,  "SampleApp"},
         {facility,  local0},    %% may be overridden by handlers
         {options,   [pid, cons, perror]},
@@ -53,9 +56,11 @@ An example might look like the following:
     . . .
 ].
 ```
+> Refer to [syslog.app](./src/syslog.app.src) and below for further details on the above settings.
+
 With this configuration, `syslog` will cause the configured handlers to be loaded once its own initialization is complete.
 
-***Why are the `logger` handlers specified in the `syslog` section instead of under `kernel` where the OTP docs tell me to put them?***
+***Why are the 'logger' handlers specified in the 'syslog' section instead of under 'kernel' where the OTP docs tell me to put them?***
 
 Configuring the `syslog` `logger` handlers inside the `syslog` section ensures that the `syslog` application is up and running before the handlers are added.
 Adding the handlers in the `kernel -> logger` section _may_ result in the handlers being added before the `syslog` application is started, resulting in obscure `noproc` exceptions.
@@ -96,7 +101,7 @@ If not specified, `options` defaults to `[pid, cons]`.
 Handlers are configured as documented for the
  [`logger`](https://www.erlang.org/doc/apps/kernel/logger_chapter.html#configuration)
 application.
-`syslog` handlers' configuration is a single `facility` atom, or the atom `default` to use the global `syslog` setting:
+`syslog` handlers' `config` is a single `facility` atom, or the atom `default` to use the global `syslog` setting:
 
 ```erlang
 {logger, [
@@ -105,6 +110,28 @@ application.
     . . .
 ]}
 ```
+
+The built-in formatter in the `syslog` module is optimized for speed, with minimal configuration options:
+* `chars_limit`, `depth`, and `max_size` behave as documented for the corresponding
+  [`logger_formatter:config()`](https://www.erlang.org/doc/apps/kernel/logger_formatter.html#t:config/0) options.
+* `single_line` _may_ be specified with the value `true` and `legacy_header` _may_ be specified with the value `false`.
+  * Any other values result in errors from `syslog:check_config/1`.
+  * As this is the default behavior, there's no benefit in specifying them, they're allowed only for compatibility.
+* Any other keys in the configuration map result in errors from `syslog:check_config/1`.
+
+The built-in formatter's default configuration is roughly analogous to,
+but considerably faster than, a `logger_formatter` configuration of:
+```
+#{
+    legacy_header => false,
+    single_line => true,
+    template => [ level, " ", {pid, [pid, ":"], []},
+                  {mfa, [mfa, {line, [":", line, ":"], ":"}, []}, " ", msg ]
+}
+```
+Note that the timestamp and its representation is provided by the OS syslog facility,
+not by this handler, so if you do choose to use the `logger_formatter` module's
+formatter you should generally _NOT_ include the `time` field in the template.
 
 Handlers may also be added and configured through
  [`logger:add_handler/3`](https://www.erlang.org/doc/man/logger.html#add_handler-3)
@@ -122,7 +149,12 @@ Add the following dependency to your `rebar.config` file's `deps` section and bu
 ```erlang
 {deps, [
     . . .
-    {syslog, {git, "<this-repo-url>.git", {branch, "master"}}}
+    {syslog,
+        {git, "https://github.com/OpenRiak/syslog_nif.git"
+            %% The repo's default branch will always be the latest production
+            %% version, or you can specify a specific branch if needed.
+            , {branch, "openriak-3.2"}
+    }}
 ]}.
 ```
 If you're packaging your application with `relx` be sure to include `syslog` in the list of packaged libraries. Again, adding it near the head of the list is recommended.
@@ -130,18 +162,18 @@ If you're packaging your application with `relx` be sure to include `syslog` in 
 ## Platform Support
 The `syslog` handler supports Linux, BSD, and macOS operating systems.
 
-Other Unix systems _may_ work but are untested.
+Other Unix systems _should_ work but are untested.
 
 ### Implementation
 The implementation relies on OS conformance to the
- [IEEE syslog API](https://pubs.opengroup.org/onlinepubs/9699919799/functions/syslog.html)
+ [IEEE syslog API](https://pubs.opengroup.org/onlinepubs/9799919799/functions/syslog.html)
 and
  [IETF syslog protocol](https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1) 
 standards, supported by all common Unix variants.
 
 Based on this widespread support, we're able to translate directly between atoms representing facilities, levels, and severities and their integral mappings in simple optimized Erlang code to keep the NIF itself small, uncluttered, and _fast_.
 
-The logging path is optimized for througput, so don't expect to learn much by inspecing the runtime handler configuration without the code in front of you.
+The logging path is optimized for throughput, so don't expect to learn much by inspecting the runtime handler configuration without the code in front of you.
 
 > Facility 5 (syslog) is reserved for internal syslog use.<br/>
 > Facilities 12-15 vary across platforms and are reserved for system use.<br/>
@@ -150,4 +182,4 @@ The logging path is optimized for througput, so don't expect to learn much by in
 ## Bugs
 What??? No way ...
 
-Yeah, you should probably file an issue.
+Yeah, you should probably file an [issue](https://github.com/OpenRiak/syslog_nif/issues).

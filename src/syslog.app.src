@@ -1,7 +1,7 @@
 %% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2023 Workday, Inc.
+%% Copyright (c) 2023-2025 Workday, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -21,11 +21,45 @@
 
 {application, syslog, [
     {description,   "An Erlang logger syslog backend"},
-    {vsn,           "1.0.0"},
+    {vsn,           "1.1.0"},
     {registered,    [syslog]},
     {mod,           {syslog, []}},
     {applications,  [kernel, stdlib]},
     {modules,       [syslog]},
-    {env,           []},
-    {licenses,      ["Apache 2.0"]}
+    {env,           [
+        %% Recognized configuration:
+
+        %% Source identity provided to the OS openlog call's 'ident' parameter.
+        %% Defaults to the basename of the last -progname parameter returned
+        %% by init:get_argument(progname).
+        % {identity,  Identity :: syslog:ident()}
+
+        %% The name of the global facility provided to the OS openlog call's
+        %% 'facility' parameter.
+        %% This can be overridden when adding a handler.
+        %% Defaults to 'user'.
+        % {facility,  Facility :: syslog:facility()}
+
+        %% The list of symbolic options provided to the OS openlog call's
+        %% 'logopt' parameter.
+        %% Defaults to [pid, cons].
+        % {options,   Options :: list(syslog:option())}
+
+        %% One or more handlers MAY be configured to start automatically after
+        %% the syslog application is started.
+        % {logger, [
+        %     {handler, syslog_handler, syslog, #{
+        %         config => default,
+        %         formatter => {syslog, #{
+        %             %% Setting a hard line length limit is recommended.
+        %             %% All known syslog subsystems can handle 512 characters.
+        %             max_size => 512
+        %         }}
+        %     }}
+        % ]}
+    ]},
+    {licenses,      ["Apache 2.0"]},
+    {links,         [
+        {"GitHub",  "https://github.com/OpenRiak/syslog_nif"}
+    ]}
 ]}.
